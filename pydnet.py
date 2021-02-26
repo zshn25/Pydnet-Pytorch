@@ -35,20 +35,23 @@ try:
 except ImportError:
     from torch.utils.model_zoo import load_url as load_state_dict_from_url
 
+
 class SigmoidOnLastChannel(nn.Module):
     # Applies sigmoid on last channel of the input tensor and returns it
     def __init__(self):
         super(SigmoidOnLastChannel, self).__init__()
         self.sigmoid = nn.Sigmoid()
-        
+
     def forward(self, x):
-        return 0.3 * self.sigmoid(x[:,-2:-1,:,:])
+        return 0.3 * self.sigmoid(x[:, -2:-1, :, :])
+
 
 class Pydnet(nn.Module):
     """ General Autoencoder to output in the same format as Monodepth2"""
-    def __init__(self, scales=[0,1,2,3],
-                 enc_version = "mobilepydnet", 
-                 dec_version = "mobilepydnet",
+    def __init__(self,
+                 scales=[0, 1, 2, 3],
+                 enc_version="mobilepydnet",
+                 dec_version="mobilepydnet",
                  pretrained=False):
         """
         Initializes an autoencoder supporting wide range of architectures
@@ -76,121 +79,191 @@ class Pydnet(nn.Module):
 
         self.scales = scales
         self.enc_version, self.dec_version = enc_version, dec_version
-        
-        # Encoder 
+
+        # Encoder
         if "pydnet" in enc_version:
             self.enc_channels = [16, 32, 64, 96, 128, 192]
-            self.encoder = PydnetEncoder(mobile_version=True
-                                            if "mobile" in enc_version else False,
-                                         channels=self.enc_channels)
+            self.encoder = PydnetEncoder(
+                mobile_version=True if "mobile" in enc_version else False,
+                channels=self.enc_channels)
+        elif "csp" in enc_version.lower():
+            try:
+                from nanodet.model.backbone import CustomCspNet
+            except ModuleNotFoundError as e:
+                print("NanoDet not found. Please install NanoDet")
+                raise
+
+            net_cfg =  [[ 'Conv', 3, 32, 3, 2],  # 1/2
+                        [ 'MaxPool', 3, 2 ],  # 1/4
+                        [ 'CspBlock', 32, 1, 3, 1 ],  # 1/4
+                        [ 'CspBlock', 64, 2, 3, 2 ],  # 1/8
+                        [ 'CspBlock', 128, 2, 3, 2 ],  # 1/16
+                        [ 'CspBlock', 256, 3, 3, 2 ]]  # 1/32
+
+            self.encoder = CustomCspNet(net_cfg=net_cfg,
+                                        out_stages=[0, 2, 3, 4, 5],
+                                        activation="LeakyReLU")
+
+            # PAN neck
+            if "pan" in enc_version.lower():
+                from nanodet.model.fpn import PAN
+
+                in_channels= [32, 64, 128, 256, 512]
+                pan=PAN(in_channels=in_channels, out_channels=128, start_level= 0, num_outs= 5)
+
+                self.encoder = nn.Sequential(self.encoder, pan) # combine with encoder
+                self.enc_channels = [128, 128, 128, 128, 128]
+
+            else:
+                self.enc_channels = [32, 64, 128, 256, 512]
         else:
             import timm
             try:
-                self.encoder = timm.create_model(enc_version,features_only=True,pretrained=pretrained)
+                self.encoder = timm.create_model(enc_version,
+                                                 features_only=True,
+                                                 pretrained=pretrained)
                 self.enc_channels = self.encoder.feature_info.channels()
             except:
-                raise NotImplementedError("{} encoder not yet supported!".format(enc_version))
+                raise NotImplementedError(
+                    "{} encoder not yet supported!".format(enc_version))
         # Decoder
         if "pydnet" in dec_version:
-            self.decoder = PydnetDecoder(mobile_version=True if "mobile" in dec_version else False,
-                                        channels=self.enc_channels,
-                                        scales=self.scales)
+            self.decoder = PydnetDecoder(
+                mobile_version=True if "mobile" in dec_version else False,
+                channels=self.enc_channels,
+                scales=self.scales)
         else:
-            self.decoder = GeneralDecoder(channels=self.enc_channels,scales=self.scales)
+            self.decoder = GeneralDecoder(channels=self.enc_channels,
+                                          scales=self.scales)
 
     def forward(self, x):
         """Runs the forward pass of the initialized autoencoder"""
-        self.features=self.encoder(x)
+        self.features = self.encoder(x)
         output = self.decoder(self.features)
         if "pydnet" in self.dec_version:
-            return {k:F.interpolate(v,
-                    scale_factor=2, mode = "nearest", align_corners = True)
-                         for k,v in output.items()}
+            return {
+                k: F.interpolate(v,
+                                 scale_factor=2,
+                                 mode="nearest",
+                                 align_corners=True)
+                for k, v in output.items()
+            }
         else:
             return output
 
 class PydnetEncoder(nn.Module):
-    def __init__(self, mobile_version=True, channels=[16, 32, 64, 96, 128, 192]) :
+    def __init__(self,
+                 mobile_version=True,
+                 channels=[16, 32, 64, 96, 128, 192]):
         super(PydnetEncoder, self).__init__()
 
         self.mobile_version = mobile_version
         self.channels = channels
 
         # Define all layers
-        for i in range(len(self.channels)): # 0-5
+        for i in range(len(self.channels)):  # 0-5
             # Encoder pyramid
-            setattr(self, "conv{}".format(i), self.conv_block(3 if i==0 else self.channels[i-1], self.channels[i]))
-        
+            setattr(
+                self, "conv{}".format(i),
+                self.conv_block(3 if i == 0 else self.channels[i - 1],
+                                self.channels[i]))
+
     def forward(self, x):
         # Pass through encoder
         features = []
         # x = (x - 0.45) / 0.225 # Normalize only for models pretrained on ImageNet
 
         for i in range(len(self.channels)):
-            x = getattr(self, "conv{}".format(i))(x) 
+            x = getattr(self, "conv{}".format(i))(x)
             features.append(x)
 
         return features
 
     def conv_block(self, in_channels, out_channels):
         return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1), 
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2)
-        )
+            nn.Conv2d(in_channels,
+                      out_channels,
+                      kernel_size=3,
+                      stride=2,
+                      padding=1), nn.LeakyReLU(0.2),
+            nn.Conv2d(out_channels,
+                      out_channels,
+                      kernel_size=3,
+                      stride=1,
+                      padding=1), nn.LeakyReLU(0.2))
+
 
 class PydnetDecoder(nn.Module):
     """
     PydnetDecoder
     """
-    def __init__(self, channels=[16, 32, 64, 96, 128, 192], scales=[0,1,2,3], mobile_version = False):
+    def __init__(self,
+                 channels=[16, 32, 64, 96, 128, 192],
+                 scales=[0, 1, 2, 3],
+                 mobile_version=False):
         super(PydnetDecoder, self).__init__()
-        
+
         self.channels = channels
         self.scales = scales
         self.mobile_version = mobile_version
-        
+
         # Define all layers
-        for i in range(len(self.channels)): # 0-5
+        for i in range(len(self.channels)):  # 0-5
             # Decoders
-            setattr(self, "decoder{}".format(i), self.decoder_block(self.channels[i] if i==len(self.channels)-1 else self.channels[i]+8)) # +8 for the concatenated layers from previous output
-        
+            setattr(
+                self, "decoder{}".format(i),
+                self.decoder_block(
+                    self.channels[i] if i == len(self.channels) -
+                    1 else self.channels[i] +
+                    8))  # +8 for the concatenated layers from previous output
+
         # Final activation regressor after each decoder
         if mobile_version:
-            self.regressor = nn.Conv2d(8, 1, kernel_size=3, stride=1, padding=1)
+            self.regressor = nn.Conv2d(8,
+                                       1,
+                                       kernel_size=3,
+                                       stride=1,
+                                       padding=1)
         else:
             self.regressor = SigmoidOnLastChannel()
-        
+
         # Upsampling
         if mobile_version:
             # Transpose convolutions have been replaced by upsampling and convolution blocks to avoid checkerboard artifacts (https://distill.pub/2016/deconv-checkerboard/)
             self.deconv = nn.Sequential(
-                nn.Upsample(scale_factor=2, mode = "bilinear", align_corners = True),
+                nn.Upsample(scale_factor=2,
+                            mode="bilinear",
+                            align_corners=True),
                 # Original Tensorflow code uses 2x2 filter with same padding. For doing this in Pytorch, we need to do padding only on the right/bottom side of the image
-                nn.ZeroPad2d((0,1,0,1)),
-                nn.Conv2d(8, 8, kernel_size=2, stride=1, padding=0)
-            )
+                nn.ZeroPad2d((0, 1, 0, 1)),
+                nn.Conv2d(8, 8, kernel_size=2, stride=1, padding=0))
         else:
-            self.deconv = nn.ConvTranspose2d(in_channels=8, out_channels=8, kernel_size=2, stride=2)
+            self.deconv = nn.ConvTranspose2d(in_channels=8,
+                                             out_channels=8,
+                                             kernel_size=2,
+                                             stride=2)
 
-        
     def forward(self, features):
         # Pass through encoder
-        outputs={}
-        assert len(features)==len(self.channels), "# features must be same as len of channels" 
+        outputs = {}
+        assert len(features) == len(
+            self.channels), "# features must be same as len of channels"
         x = features[-1]
-        for i in range(len(self.channels)-2,-1,-1): # 4,3,2,1,0
-            x = getattr(self, "decoder{}".format(i+1))(x) # 5,4,3,2,1
+        for i in range(len(self.channels) - 2, -1, -1):  # 4,3,2,1,0
+            x = getattr(self, "decoder{}".format(i + 1))(x)  # 5,4,3,2,1
             deconv_out = self.deconv(x)
-            if i+1 in self.scales:
-                outputs[("disp",i+1)] = self.regressor(x)
+            if i + 1 in self.scales:
+                outputs[("disp", i + 1)] = self.regressor(x)
             # if i>0:
             x = torch.cat((features[i], deconv_out), 1)
 
         x = self.decoder0(x)
-        outputs[("disp",0)] = self.regressor(x)
-        return outputs
+        outputs[("disp", 0)] = self.regressor(x)
+
+        if len(self.scales)==1:
+            return outputs[("disp", self.scales[0])]
+        else:
+            return outputs
 
     def decoder_block(self, in_channels):
         return nn.Sequential(
@@ -203,100 +276,167 @@ class PydnetDecoder(nn.Module):
             nn.Conv2d(32, 8, kernel_size=3, stride=1, padding=1),
         )
 
+
 class GeneralDecoder(nn.Module):
-    def __init__(self, channels=[64, 64, 128, 256, 512], scales=[0,1,2,3], upsample_mode="nearest"):
+    def __init__(self,
+                 channels=[64, 64, 128, 256, 512],
+                 scales=[0, 1, 2, 3],
+                 upsample_mode="nearest"):
         super(GeneralDecoder, self).__init__()
 
         self.scales = scales
         self.channels = channels
 
         # Define all layers
-        for i in range(len(self.channels)-2,-1,-1): # 3,2,1,0
+        for i in range(len(self.channels) - 2, -1, -1):  # 3,2,1,0
             # Decoders
-            setattr(self, "decoder{}".format(i), DecoderBlock(self.channels[i+1],
-                                                                    self.channels[i]))
-            setattr(self, "regressor{}".format(i),
-                    nn.Sequential(nn.Conv2d(self.channels[i],1,3,stride=1,padding=1),
+            setattr(self, "decoder{}".format(i),
+                    DecoderBlock(self.channels[i + 1], self.channels[i]))
+            setattr(
+                self, "regressor{}".format(i),
+                nn.Sequential(
+                    nn.Conv2d(self.channels[i], 1, 3, stride=1, padding=1),
                     nn.Sigmoid()))
-        
+
             if upsample_mode == "pixel_shuffle":
-                setattr(self, "conv_shuffle{}".format(i), nn.Conv2d(self.channels[i+1],
-                                                                self.channels[i+1]*4,
-                                                                3,stride=1,padding=1,bias=0))
+                setattr(
+                    self, "conv_shuffle{}".format(i),
+                    nn.Conv2d(self.channels[i + 1],
+                              self.channels[i + 1] * 4,
+                              3,
+                              stride=1,
+                              padding=1,
+                              bias=0))
             else:
                 setattr(self, "conv_shuffle{}".format(i), nn.Identity())
         if upsample_mode == "pixel_shuffle":
             self.upsample = nn.PixelShuffle(2)
         else:
-            self.upsample = lambda x : F.interpolate(x, scale_factor=2, mode=upsample_mode)
+            self.upsample = lambda x: F.interpolate(
+                x, scale_factor=2, mode=upsample_mode)
+
+        self.output_conv = nn.Conv2d(len(self.scales), 1, 1)
 
     def forward(self, features):
-        outputs={}
-        assert len(features)==len(self.channels), "# features must be same as len of channels" 
-        
+        outputs = {}
+        assert len(features) == len(
+            self.channels), "# features must be same as len of channels"
+
         # TODO: Indexing causes scripting error. Change it to some other logic
-        x = self.upsample(features[-1]) # latent feature
-        for i in range(len(features)-2,-1,-1): # 3,2,1,0
+        x = self.upsample(features[-1])  # latent feature
+        for i in range(len(features) - 2, -1, -1):  # 3,2,1,0
             x = getattr(self, "decoder{}".format(i))(x)
-            x += features[i] # u-net skip connections from encoder
+            x += features[i]  # u-net skip connections from encoder
             x = self.upsample(x)
             if i in self.scales:
-                outputs[("disp", i)]= getattr(self, "regressor{}".format(i))(x)
-        
-        return outputs
+                outputs[("disp", i)] = getattr(self,
+                                               "regressor{}".format(i))(x)
+        # combine all scales into scale 0 
+        # outputs[("disp", 0)] = self.output_conv(
+        #                  torch.cat(
+        #                      [outputs[("disp", i)] for i in range(len(outputs.keys()))],
+        #                  dim=1)
+                    #   )
+        if len(self.scales) == 1:
+            return outputs[("disp", self.scales[0])]
+        else:
+            return outputs
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(DecoderBlock, self).__init__()
 
         self.decoder_block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=1),
+            nn.Conv2d(in_channels,
+                      out_channels,
+                      kernel_size=3,
+                      padding=1,
+                      stride=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, stride=1),
+            nn.Conv2d(out_channels,
+                      out_channels,
+                      kernel_size=3,
+                      padding=1,
+                      stride=1),
             nn.ReLU(inplace=True),
-            )
-        self.skip = nn.Conv2d(in_channels, out_channels, 1, stride=1, padding=0)
+        )
+        self.skip = nn.Conv2d(in_channels,
+                              out_channels,
+                              1,
+                              stride=1,
+                              padding=0)
+
     def forward(self, x):
         return self.decoder_block(x) + self.skip(x)
 
 
 def decoder_block(self, in_channels, out_channels):
     return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, stride=1),
-            nn.ReLU(inplace=True),
-                        )
+        nn.Conv2d(in_channels,
+                  out_channels,
+                  kernel_size=3,
+                  padding=1,
+                  stride=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_channels,
+                  out_channels,
+                  kernel_size=3,
+                  padding=1,
+                  stride=1),
+        nn.ReLU(inplace=True),
+    )
+
 
 class PyddepthInference(Pydnet):
-    def __init__(self, scales=[0,1,2,3], enc_version = "mobile_pydnet",
-                 dec_version="mobile_pydnet", pretrained=False,
-                 min_depth=0.1, max_depth=100.):
-        super(PyddepthInference, self).__init__(scales, 
+    def __init__(self,
+                 scales=[0, 1, 2, 3],
+                 enc_version="resnet18",
+                 dec_version="general",
+                 pretrained=False,
+                 min_depth=0.1,
+                 max_depth=100.):
+        super(PyddepthInference, self).__init__(scales,
                                                 enc_version=enc_version,
                                                 dec_version=dec_version)
-        
-        self.min_disp = 1./max_depth
-        self.max_disp = 1./max(min_depth, 1e-7)
-        
+
+        self.min_disp = 1. / max_depth
+        self.max_disp = 1. / max(min_depth, 1e-7)
+
+        # Having dict in decoder returns will cause scripting error and cause problem when converting to tflite
+        # So, we replace deocder to return only the scale 0 output
+        # Decoder
+        if "pydnet" in dec_version:
+            self.decoder = PydnetDecoder(
+                mobile_version=True if "mobile" in dec_version else False,
+                channels=self.enc_channels,
+                scales=[0])
+        else:
+            self.decoder = GeneralDecoder(channels=self.enc_channels,
+                                          scales=[0])
+
         if pretrained:
-            if enc_version=="resnet18" and dec_version=="general":
+            if enc_version == "resnet18" and dec_version == "general":
                 # Fetch pretrained Kitti model
                 try:
-                    loaded_dict = load_state_dict_from_url("https://github.com/Easy2Ride/packnet-sfm/releases/download/v1.0/resnet18_general_roll.pth")
+                    loaded_dict = load_state_dict_from_url(
+                        "https://github.com/Easy2Ride/packnet-sfm/releases/download/v1.0/resnet18_general_roll.pth"
+                    )
                     self.load_state_dict(loaded_dict)
                 except:
-                    print("Loading pretrained model failed. Please load it manually")
+                    print(
+                        "Loading pretrained model failed. Please load it manually"
+                    )
             else:
-                raise NotImplementedError("Loading pretrained model failed. Pretrained model not available")
+                raise NotImplementedError(
+                    "Loading pretrained model failed. Pretrained model not available"
+                )
 
     @torch.no_grad()
     def forward(self, x):
         self.encoder.eval()
         self.decoder.eval()
-        x =self.encoder(x)
-        x = self.decoder(x)[("disp",0)]
-        
+        x = self.encoder(x)
+        x = self.decoder(x)
+
         return self.min_disp + (self.max_disp - self.min_disp) * x
         #return F.interpolate(self.pydnet(x)[0], scale_factor=2, mode = "bilinear", align_corners = True)
-

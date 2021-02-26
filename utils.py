@@ -1,6 +1,8 @@
 from matplotlib import pyplot as plt
 import numpy as np
 import torch
+from torch import nn
+from torch.nn.utils.fusion import fuse_conv_bn_eval
 
 def time_torch_model(model, input, print_time=False):
     """
@@ -9,20 +11,17 @@ def time_torch_model(model, input, print_time=False):
     ---------
         model: nn-Module
         input: torch.Tensor
-        use_cuda: bool       To use CUDA GPU or not (default: True)
         print_time: bool     Print the time?        (default: False)
     Output:
     ---------
         total_time_ms
     Author: Zeeshan Khan Suri
     """
-    model.eval()
     use_cuda = 'cuda' in input.device.type
     if use_cuda:
         torch.cuda.current_stream().synchronize()
-    with torch.no_grad():
-        with torch.autograd.profiler.profile(use_cuda=use_cuda) as prof:
-            model(input)
+    with torch.autograd.profiler.profile(use_cuda=use_cuda) as prof:
+        model(input)
     total_time_ms = sum([item.cuda_time for item in prof.function_events])/1000
     if print_time:
         print("{:.3f} ms".format(total_time_ms))
@@ -80,3 +79,45 @@ def scale_disp(disp, min_depth, max_depth):
     min_disp, max_disp = 1 / max_depth, 1/min_depth
     scaled_disp = min_disp + (max_disp - min_disp) * disp
     return scaled_disp, 1/scaled_disp
+
+def fuse_all_conv_bn(model:nn.Module):
+    """
+    Recursively fuses all pairs of Conv2d and BatchNorm2d of a nn.Module
+    Usage:
+        fuse_all_conv_bn(model)
+    License: Copyright Zeeshan Khan Suri, 2021, MIT License
+    """
+    stack = []
+    for name, module in model.named_children(): # immediate children
+        if list(module.named_children()): # is not empty (not a leaf)
+            fuse_all_conv_bn(module)
+            
+        if isinstance(module, nn.BatchNorm2d):
+            if isinstance(stack[-1][1], nn.Conv2d):
+                setattr(model, stack[-1][0], fuse_conv_bn_eval(stack[-1][1], module))
+                setattr(model, name, nn.Identity())
+        else:
+            stack.append((name, module))
+
+# Print iterations progress
+def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█', printEnd = "\r"):
+    """
+    Taken from https://stackoverflow.com/a/34325723/5984672
+    Call in a loop to create terminal progress bar
+    @params:
+        iteration   - Required  : current iteration (Int)
+        total       - Required  : total iterations (Int)
+        prefix      - Optional  : prefix string (Str)
+        suffix      - Optional  : suffix string (Str)
+        decimals    - Optional  : positive number of decimals in percent complete (Int)
+        length      - Optional  : character length of bar (Int)
+        fill        - Optional  : bar fill character (Str)
+        printEnd    - Optional  : end character (e.g. "\r", "\r\n") (Str)
+    """
+    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+    filledLength = int(length * iteration // total)
+    bar = fill * filledLength + '-' * (length - filledLength)
+    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end = printEnd)
+    # Print New Line on Complete
+    if iteration == total: 
+        print()
