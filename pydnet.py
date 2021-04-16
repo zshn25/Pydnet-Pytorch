@@ -315,7 +315,7 @@ class GeneralDecoder(nn.Module):
             self.upsample = lambda x: F.interpolate(
                 x, scale_factor=2, mode=upsample_mode)
 
-        self.output_conv = nn.Conv2d(len(self.scales), 1, 1)
+        # self.output_conv = nn.Conv2d(len(self.scales), 1, 1)
 
     def forward(self, features):
         outputs = {}
